@@ -3,7 +3,8 @@ FROM ubuntu:22.04
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y curl python3 python3-venv python3-pip && \
+    apt-get install -y curl python3 python3-venv python3-pip ca-certificates && \
+    update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Ollama CLI
