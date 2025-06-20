@@ -5,6 +5,9 @@ from typing import List
 from fastapi import FastAPI, HTTPException
 from pymongo import MongoClient
 import datetime
+
+from pymongo.server_api import ServerApi
+
 from src import config
 import ollama
 
@@ -143,7 +146,7 @@ async def connect_to_mongodb():
     global client, db, meta_collection, embeddings_collection
 
     try:
-        client = MongoClient(config.MONGO_URI)
+        client = MongoClient(config.MONGO_URI, server_api=ServerApi('1'))
         db = client[config.DATABASE_NAME]
         meta_collection = db[config.META_COLLECTION]
         embeddings_collection = db[config.EMBEDDINGS_COLLECTION]
