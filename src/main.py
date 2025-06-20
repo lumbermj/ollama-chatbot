@@ -271,10 +271,14 @@ Provide a helpful, professional response based on this context.'''
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+
+    port = int(os.environ.get("PORT", 8080))
+
     uvicorn.run(
         "src.main:app",  # Adjust if your file is named differently
         host="0.0.0.0",
-        port=8080,
-        reload=True,
+        port=port,
+        reload=False,
         log_level="info"
     )
