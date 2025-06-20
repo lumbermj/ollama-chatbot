@@ -1,25 +1,32 @@
-# Step 1: Use an official Python runtime as a parent image
-FROM python:3.9-slim
+# Base image for Ollama & Python
+FROM ubuntu:22.04
 
-# Step 2: Set the working directory in the container
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y curl python3 python3-venv python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Ollama CLI
+RUN curl https://ollama.com/install.sh | sh
+
+# Set working directory
 WORKDIR /app
 
-# Step 3: Copy the current directory contents into the container at /app
-COPY . /app
+# Copy dependency list and install Python virtualenv
+COPY requirements.txt .
+RUN python3 -m venv venv && \
+    venv/bin/pip install --upgrade pip && \
+    venv/bin/pip install -r requirements.txt
 
-# Step 4: Install the necessary dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy source code into the container
+COPY src ./src
 
-COPY ./src /app/src
+# Copy and make the entrypoint script executable
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Set the working directory to the src folder
-WORKDIR /app/src
+# Expose Ollama and FastAPI ports
+EXPOSE 11434 8080
 
-# Step 5: Set environment variables from the .env file (optional, can be done via docker-compose or environment)
-ENV PYTHONUNBUFFERED=1
-
-# Step 6: Expose port 5000 if you're running a web app (optional, adjust based on your app's requirements)
-EXPOSE 5000
-
-# Step 7: Define the command to run the application
-CMD ["python", "main.py"]
+# Use the entrypoint to start services
+ENTRYPOINT ["/entrypoint.sh"]
