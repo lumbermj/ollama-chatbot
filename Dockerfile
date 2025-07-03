@@ -10,6 +10,11 @@ RUN apt-get update && \
 # Install Ollama CLI
 RUN curl https://ollama.com/install.sh | sh
 
+# Install Ollama using direct binary download (more reliable in Docker)
+#RUN curl -L -o ollama https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64 && \
+#    chmod +x ollama && \
+#    mv ollama /usr/local/bin/ollama
+
 # Set working directory
 WORKDIR /app
 
@@ -27,7 +32,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Expose Ollama and FastAPI ports
-EXPOSE 11434 8080
+EXPOSE 11434 3000
 
 # Use the entrypoint to start services
 ENTRYPOINT ["/entrypoint.sh"]
