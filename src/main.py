@@ -1,11 +1,16 @@
 import datetime
 import logging
-from typing import List, Optional, Dict, Any
-import uuid
+import time
+import asyncio
+import json
+from functools import wraps
+from typing import List, Optional, AsyncGenerator
 
+import aiohttp
 import ollama
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from src import config
 from src import mongodb
@@ -15,161 +20,61 @@ from src.models import response_model, health_model, query_model, database_model
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# In-memory conversation storage (for production, consider Redis or database)
-conversation_store: Dict[str, Dict[str, Any]] = {}
+# Global clients
+ollama_client = ollama.Client(host='http://127.0.0.1:11434')
+http_session = None
 
 app = FastAPI(
     title="Customer Support RAG API",
-    description="A RAG-powered customer support chatbot API with conversation memory using MongoDB and Ollama",
-    version="1.1.0",
+    description="A RAG-powered customer support chatbot API using MongoDB and Ollama",
+    version="1.0.0",
     lifespan=mongodb.lifespan
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure as needed for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# Enhanced models for conversation context
-class ConversationExchange:
-    def __init__(self, question: str, answer: str, timestamp: datetime.datetime = None):
-        self.question = question
-        self.answer = answer
-        self.timestamp = timestamp or datetime.datetime.now(datetime.timezone.utc)
+async def get_http_session():
+    """Get or create HTTP session"""
+    global http_session
+    if http_session is None:
+        http_session = aiohttp.ClientSession()
+    return http_session
 
 
-class ConversationContext:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.conversation_history: List[ConversationExchange] = []
-        self.customer_context: Dict[str, Any] = {}
-        self.created_at = datetime.datetime.now(datetime.timezone.utc)
-        self.last_accessed = datetime.datetime.now(datetime.timezone.utc)
-        self.max_history_length = 5
+def timing_decorator(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.time()
+        result = await func(*args, **kwargs)
+        end = time.time()
+        print(f"{func.__name__} took {end - start:.2f}s")
+        return result
 
-    def add_exchange(self, question: str, answer: str):
-        """Add a Q&A exchange to conversation history"""
-        self.conversation_history.append(ConversationExchange(question, answer))
-        self.last_accessed = datetime.datetime.now(datetime.timezone.utc)
-
-        # Keep only recent exchanges
-        if len(self.conversation_history) > self.max_history_length:
-            self.conversation_history = self.conversation_history[-self.max_history_length:]
-
-    def update_customer_context(self, updates: Dict[str, Any]):
-        """Update customer-specific context"""
-        self.customer_context.update(updates)
-        self.last_accessed = datetime.datetime.now(datetime.timezone.utc)
-
-    def get_conversation_summary(self) -> Dict[str, Any]:
-        """Get a summary of the conversation"""
-        return {
-            "session_id": self.session_id,
-            "total_exchanges": len(self.conversation_history),
-            "customer_context": self.customer_context,
-            "last_accessed": self.last_accessed.isoformat(),
-            "recent_questions": [ex.question for ex in self.conversation_history[-3:]]
-        }
-
-
-def get_or_create_conversation(session_id: str) -> ConversationContext:
-    """Get existing conversation or create new one"""
-    if session_id not in conversation_store:
-        conversation_store[session_id] = ConversationContext(session_id)
-
-    conversation_store[session_id].last_accessed = datetime.datetime.now(datetime.timezone.utc)
-    return conversation_store[session_id]
-
-
-def cleanup_old_conversations():
-    """Clean up conversations older than 24 hours"""
-    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
-    expired_sessions = [
-        session_id for session_id, conv in conversation_store.items()
-        if conv.last_accessed < cutoff_time
-    ]
-    for session_id in expired_sessions:
-        del conversation_store[session_id]
-
-    if expired_sessions:
-        logger.info(f"Cleaned up {len(expired_sessions)} expired conversation sessions")
-
-
-def build_contextual_prompt(query: str, context_chunks: List[str], conversation: ConversationContext) -> str:
-    """Build enhanced prompt with conversation context"""
-
-    # Format conversation history
-    conversation_context = ""
-    if conversation.conversation_history:
-        conversation_context = "\n\nCONVERSATION HISTORY (for context):\n"
-        # Use last 3 exchanges to keep prompt manageable
-        recent_history = conversation.conversation_history[-3:]
-        for i, exchange in enumerate(recent_history, 1):
-            conversation_context += f"Previous Q{i}: {exchange.question}\n"
-            # Truncate long answers to keep prompt size reasonable
-            answer_preview = exchange.answer[:200] + "..." if len(exchange.answer) > 200 else exchange.answer
-            conversation_context += f"Previous A{i}: {answer_preview}\n"
-
-    # Format customer context
-    customer_info = ""
-    if conversation.customer_context:
-        customer_info = f"\n\nCUSTOMER CONTEXT:\n"
-        for key, value in conversation.customer_context.items():
-            customer_info += f"- {key}: {value}\n"
-
-    instruction_prompt = f'''You are a professional customer support assistant. Your role is to provide helpful, accurate, and contextually aware responses.
-
-INSTRUCTIONS:
-1. Use ONLY the provided knowledge base and conversation history to answer questions
-2. If the current question relates to previous questions in the conversation, acknowledge the connection explicitly
-3. Maintain consistency with your previous responses in this conversation
-4. Reference previous parts of the conversation when relevant (e.g., "As I mentioned earlier...")
-5. If you cannot answer based on the provided context, clearly state this limitation
-6. Be concise but thorough, maintaining a professional and helpful tone
-7. If this appears to be a follow-up question, provide context-aware responses
-
-KNOWLEDGE BASE CONTEXT:
-{chr(10).join([f'- {chunk}' for chunk in context_chunks])}
-{conversation_context}
-{customer_info}
-
-CURRENT QUESTION: {query}
-
-Provide a helpful response that considers both the knowledge base and conversation context. If this question builds on previous questions, make clear connections and provide a coherent answer.'''
-
-    return instruction_prompt
+    return wrapper
 
 
 @app.get("/")
 def read_root():
-    return {
-        "message": "Enhanced Customer Support RAG API with Conversation Memory",
-        "version": "1.1.0",
-        "features": ["RAG", "Conversation Memory", "Context Awareness", "Session Management"]
-    }
+    return {"message": "Hello World"}
 
 
 @app.post("/chat", response_model=response_model.ChatResponse, tags=["Chat"])
 async def chat_endpoint(request: query_model.QueryRequest):
     """
-    Enhanced chat endpoint with conversation memory and context awareness
+    Main chat endpoint that retrieves relevant context and generates a response
     """
     start_time = datetime.datetime.now(datetime.timezone.utc)
 
-    # Clean up old conversations periodically
-    cleanup_old_conversations()
-
     try:
-        # Get or create conversation session
-        session_id = getattr(request, 'session_id', None) or str(uuid.uuid4())
-        conversation = get_or_create_conversation(session_id)
-
-        # Retrieve relevant chunks
+        # Run retrieval and response generation concurrently where possible
         retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
 
         if not retrieved_chunks:
@@ -178,15 +83,8 @@ async def chat_endpoint(request: query_model.QueryRequest):
                 detail="No relevant information found in the knowledge base"
             )
 
-        # Generate contextual response
-        response_text = await generate_contextual_chat_response(
-            request.query,
-            retrieved_chunks,
-            conversation
-        )
-
-        # Add exchange to conversation history
-        conversation.add_exchange(request.query, response_text)
+        # Generate response with optimized async call
+        response_text = await generate_chat_response_async(request.query, retrieved_chunks)
 
         # Calculate processing time
         processing_time = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
@@ -197,23 +95,13 @@ async def chat_endpoint(request: query_model.QueryRequest):
                 chunk.intent = None
                 chunk.category = None
 
-        # Enhanced response with conversation context
-        response = response_model.ChatResponse(
+        return response_model.ChatResponse(
             query=request.query,
             response=response_text,
             retrieved_chunks=retrieved_chunks,
             processing_time=processing_time,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
-
-        # Add session info to response (if your response model supports it)
-        response.session_id = session_id
-        response.conversation_context = {
-            "total_exchanges": len(conversation.conversation_history),
-            "has_context": len(conversation.conversation_history) > 1
-        }
-
-        return response
 
     except HTTPException:
         raise
@@ -222,95 +110,6 @@ async def chat_endpoint(request: query_model.QueryRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.post("/chat/context", tags=["Chat"])
-async def update_customer_context(
-        session_id: str,
-        context_updates: Dict[str, Any]
-):
-    """
-    Update customer context for a conversation session
-    """
-    try:
-        conversation = get_or_create_conversation(session_id)
-        conversation.update_customer_context(context_updates)
-
-        return {
-            "message": "Customer context updated successfully",
-            "session_id": session_id,
-            "updated_context": conversation.customer_context
-        }
-
-    except Exception as e:
-        logger.error(f"Error updating customer context: {e}")
-        raise HTTPException(status_code=500, detail="Failed to update customer context")
-
-
-@app.get("/chat/sessions/{session_id}", tags=["Chat"])
-async def get_conversation_summary(session_id: str):
-    """
-    Get conversation summary for a session
-    """
-    try:
-        if session_id not in conversation_store:
-            raise HTTPException(status_code=404, detail="Conversation session not found")
-
-        conversation = conversation_store[session_id]
-        return conversation.get_conversation_summary()
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting conversation summary: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get conversation summary")
-
-
-@app.delete("/chat/sessions/{session_id}", tags=["Chat"])
-async def clear_conversation_session(session_id: str):
-    """
-    Clear/delete a conversation session
-    """
-    try:
-        if session_id in conversation_store:
-            del conversation_store[session_id]
-            return {"message": f"Conversation session {session_id} cleared successfully"}
-        else:
-            raise HTTPException(status_code=404, detail="Conversation session not found")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error clearing conversation session: {e}")
-        raise HTTPException(status_code=500, detail="Failed to clear conversation session")
-
-
-@app.get("/chat/sessions", tags=["Chat"])
-async def list_active_sessions():
-    """
-    List all active conversation sessions
-    """
-    try:
-        cleanup_old_conversations()  # Clean up before listing
-
-        sessions = []
-        for session_id, conversation in conversation_store.items():
-            sessions.append({
-                "session_id": session_id,
-                "total_exchanges": len(conversation.conversation_history),
-                "last_accessed": conversation.last_accessed.isoformat(),
-                "has_customer_context": bool(conversation.customer_context)
-            })
-
-        return {
-            "active_sessions": len(sessions),
-            "sessions": sessions
-        }
-
-    except Exception as e:
-        logger.error(f"Error listing sessions: {e}")
-        raise HTTPException(status_code=500, detail="Failed to list sessions")
-
-
-# Keep all your existing endpoints unchanged
 @app.post("/retrieve", response_model=List[response_model.RetrievedChunk], tags=["Retrieval"])
 async def retrieve_endpoint(request: query_model.QueryRequest):
     """
@@ -340,11 +139,116 @@ async def retrieve_endpoint(request: query_model.QueryRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@timing_decorator
+async def generate_chat_response_async(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
+    """Generate chat response using async HTTP calls to Ollama"""
+    try:
+        # Prepare context (optimized)
+        context_chunks = [chunk.text for chunk in retrieved_chunks]
+        max_context_length = 2000
+
+        # More efficient string joining
+        context_text = '\n - '.join(context_chunks)
+        if len(context_text) > max_context_length:
+            context_text = context_text[:max_context_length] + "..."
+
+        # Optimized prompt
+        system_prompt = f"""You are a helpful customer support chatbot. Use only the following context to answer the customer's question:
+
+{context_text}
+
+Provide a helpful, professional response based on this context."""
+
+        # Async HTTP request to Ollama
+        session = await get_http_session()
+
+        payload = {
+            "model": config.LANGUAGE_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ],
+            "stream": False,
+            "keep_alive": "5m",  # Keep model loaded longer
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "num_predict": 512  # Limit response length for speed
+            }
+        }
+
+        async with session.post(
+                "http://127.0.0.1:11434/api/chat",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            if response.status == 200:
+                result = await response.json()
+                return result["message"]["content"]
+            else:
+                error_text = await response.text()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Ollama API error: {response.status} - {error_text}"
+                )
+
+    except asyncio.TimeoutError:
+        logger.error("Ollama request timed out")
+        raise HTTPException(status_code=504, detail="Response generation timed out")
+    except Exception as e:
+        logger.error(f"Error generating chat response: {e}")
+        raise HTTPException(status_code=500, detail=f"Chat generation error: {str(e)}")
+
+
+# Fallback sync version for compatibility
+@timing_decorator
+async def generate_chat_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
+    """Original sync version - kept for backward compatibility"""
+    try:
+        # Use thread pool for sync ollama calls
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _generate_sync_response, query, retrieved_chunks)
+    except Exception as e:
+        logger.error(f"Error generating chat response: {e}")
+        raise HTTPException(status_code=500, detail="Chat generation failed")
+
+
+def _generate_sync_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
+    """Synchronous response generation"""
+    context_chunks = [chunk.text for chunk in retrieved_chunks]
+    max_context_length = 2000
+    context_text = '\n - '.join(context_chunks)
+
+    if len(context_text) > max_context_length:
+        context_text = context_text[:max_context_length] + "..."
+
+    instruction_prompt = f'''You are a helpful customer support chatbot.
+Use only the following pieces of context to answer the customer's question:
+
+{context_text}
+
+Provide a helpful, professional response based on this context.'''
+
+    response = ollama_client.chat(
+        model=config.LANGUAGE_MODEL,
+        messages=[
+            {'role': 'system', 'content': instruction_prompt},
+            {'role': 'user', 'content': query},
+        ],
+        stream=False,
+        keep_alive="5m",
+        options={
+            "temperature": 0.7,
+            "num_predict": 512
+        }
+    )
+
+    return response['message']['content']
+
+
 @app.get("/health", response_model=health_model.HealthStatus, tags=["Health"])
 async def health_check():
-    """
-    Health check endpoint
-    """
+    """Health check endpoint"""
     try:
         # Check MongoDB
         mongodb_connected = False
@@ -359,14 +263,14 @@ async def health_check():
         # Check Ollama
         ollama_available = False
         try:
-            ollama.list()  # Simple test to see if Ollama is responsive
+            ollama.list()
             ollama_available = True
         except:
             pass
 
         status = "healthy" if mongodb_connected and ollama_available else "degraded"
 
-        health_response = health_model.HealthStatus(
+        return health_model.HealthStatus(
             status=status,
             mongodb_connected=mongodb_connected,
             ollama_available=ollama_available,
@@ -375,11 +279,6 @@ async def health_check():
             language_model=config.LANGUAGE_MODEL
         )
 
-        # Add conversation memory status
-        health_response.active_conversations = len(conversation_store)
-
-        return health_response
-
     except Exception as e:
         logger.error(f"Error in health check: {e}")
         raise HTTPException(status_code=500, detail="Health check failed")
@@ -387,9 +286,7 @@ async def health_check():
 
 @app.get("/stats", response_model=database_model.DatabaseStats, tags=["Statistics"])
 async def get_database_stats():
-    """
-    Get database statistics
-    """
+    """Get database statistics"""
     try:
         meta_count = mongodb.meta_collection.count_documents({})
         embeddings_count = mongodb.embeddings_collection.count_documents({})
@@ -409,20 +306,13 @@ async def get_database_stats():
         ]
         categories = list(mongodb.meta_collection.aggregate(category_pipeline))
 
-        stats = database_model.DatabaseStats(
+        return database_model.DatabaseStats(
             total_chunks=meta_count,
             total_embeddings=embeddings_count,
             top_intents=top_intents,
             categories=categories,
             last_updated=datetime.datetime.now(datetime.timezone.utc)
         )
-
-        # Add conversation stats
-        stats.active_conversations = len(conversation_store)
-        total_exchanges = sum(len(conv.conversation_history) for conv in conversation_store.values())
-        stats.total_conversation_exchanges = total_exchanges
-
-        return stats
 
     except Exception as e:
         logger.error(f"Error getting database stats: {e}")
@@ -435,9 +325,7 @@ async def search_by_intent_or_category(
         category: Optional[str] = Query(None, description="Filter by category"),
         limit: int = Query(10, ge=1, le=100, description="Number of results to return")
 ):
-    """
-    Search chunks by intent or category
-    """
+    """Search chunks by intent or category"""
     try:
         query_filter = {}
         if intent:
@@ -462,42 +350,270 @@ async def search_by_intent_or_category(
         raise HTTPException(status_code=500, detail="Search failed")
 
 
-async def generate_contextual_chat_response(
-        query: str,
-        retrieved_chunks: List[response_model.RetrievedChunk],
-        conversation: ConversationContext
-) -> str:
-    """Generate contextual chat response using Ollama with conversation memory"""
+@app.post("/chat/stream", tags=["Chat"])
+async def chat_stream_endpoint(request: query_model.QueryRequest):
+    """
+    Streaming chat endpoint for real-time response generation
+    """
+    try:
+        # First, retrieve relevant chunks
+        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
+
+        if not retrieved_chunks:
+            # Return error as SSE event
+            async def error_stream():
+                yield f"data: {json.dumps({'error': 'No relevant information found'})}\n\n"
+
+            return StreamingResponse(error_stream(), media_type="text/plain")
+
+        # Stream the response
+        return StreamingResponse(
+            stream_chat_response(request.query, retrieved_chunks),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in streaming chat endpoint: {e}")
+
+        async def error_stream():
+            yield f"data: {json.dumps({'error': 'Internal server error'})}\n\n"
+
+        return StreamingResponse(error_stream(), media_type="text/plain")
+
+
+async def stream_chat_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> AsyncGenerator[
+    str, None]:
+    """
+    Generate streaming chat response using async HTTP calls to Ollama
+    """
     try:
         # Prepare context
         context_chunks = [chunk.text for chunk in retrieved_chunks]
+        max_context_length = 2000
 
-        # Build contextual prompt
-        instruction_prompt = build_contextual_prompt(query, context_chunks, conversation)
+        context_text = '\n - '.join(context_chunks)
+        if len(context_text) > max_context_length:
+            context_text = context_text[:max_context_length] + "..."
 
-        # Generate response
-        response = ollama.chat(
-            model=config.LANGUAGE_MODEL,
-            messages=[
-                {'role': 'system', 'content': instruction_prompt},
-                {'role': 'user', 'content': query},
+        system_prompt = f"""You are a helpful customer support chatbot. Use only the following context to answer the customer's question:
+
+{context_text}
+
+Provide a helpful, professional response based on this context."""
+
+        # Send initial metadata
+        metadata = {
+            "type": "metadata",
+            "retrieved_chunks": len(retrieved_chunks),
+            "query": query[:100] + "..." if len(query) > 100 else query
+        }
+        yield f"data: {json.dumps(metadata)}\n\n"
+
+        # Prepare streaming request to Ollama
+        session = await get_http_session()
+
+        payload = {
+            "model": config.LANGUAGE_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
             ],
-            stream=False,  # For API, we don't stream
-        )
+            "stream": True,  # Enable streaming
+            "keep_alive": "5m",
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "num_predict": 512
+            }
+        }
 
-        return response['message']['content']
+        # Stream response from Ollama
+        async with session.post(
+                "http://127.0.0.1:11434/api/chat",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60)
+        ) as response:
+
+            if response.status != 200:
+                error_text = await response.text()
+                error_data = {
+                    "type": "error",
+                    "message": f"Ollama API error: {response.status} - {error_text}"
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+                return
+
+            # Process streaming response
+            full_response = ""
+            async for line in response.content:
+                line = line.decode('utf-8').strip()
+
+                if not line:
+                    continue
+
+                try:
+                    # Parse JSON response from Ollama
+                    chunk_data = json.loads(line)
+
+                    if "message" in chunk_data and "content" in chunk_data["message"]:
+                        content = chunk_data["message"]["content"]
+                        full_response += content
+
+                        # Send content chunk
+                        chunk_response = {
+                            "type": "content",
+                            "content": content,
+                            "full_response": full_response
+                        }
+                        yield f"data: {json.dumps(chunk_response)}\n\n"
+
+                    # Check if generation is complete
+                    if chunk_data.get("done", False):
+                        # Send completion message
+                        completion_data = {
+                            "type": "complete",
+                            "full_response": full_response,
+                            "total_duration": chunk_data.get("total_duration", 0),
+                            "load_duration": chunk_data.get("load_duration", 0),
+                            "prompt_eval_count": chunk_data.get("prompt_eval_count", 0),
+                            "eval_count": chunk_data.get("eval_count", 0)
+                        }
+                        yield f"data: {json.dumps(completion_data)}\n\n"
+                        break
+
+                except json.JSONDecodeError:
+                    # Skip malformed JSON lines
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing stream chunk: {e}")
+                    continue
+
+    except asyncio.TimeoutError:
+        error_data = {
+            "type": "error",
+            "message": "Response generation timed out"
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
 
     except Exception as e:
-        logger.error(f"Error generating contextual chat response: {e}")
-        raise HTTPException(status_code=500, detail=f"Chat generation error: {str(e)}")
+        logger.error(f"Error in stream_chat_response: {e}")
+        error_data = {
+            "type": "error",
+            "message": f"Streaming error: {str(e)}"
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
 
 
-# Legacy function for backward compatibility
-async def generate_chat_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
-    """Legacy generate chat response function for backward compatibility"""
-    # Create a temporary conversation context for non-contextual calls
-    temp_conversation = ConversationContext("temp")
-    return await generate_contextual_chat_response(query, retrieved_chunks, temp_conversation)
+# Alternative: Simple text streaming version
+async def stream_chat_response_simple(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> \
+AsyncGenerator[str, None]:
+    """
+    Simplified streaming version that just streams text content
+    """
+    try:
+        context_chunks = [chunk.text for chunk in retrieved_chunks]
+        max_context_length = 2000
+
+        context_text = '\n - '.join(context_chunks)
+        if len(context_text) > max_context_length:
+            context_text = context_text[:max_context_length] + "..."
+
+        system_prompt = f"""You are a helpful customer support chatbot. Use only the following context to answer the customer's question:
+
+{context_text}
+
+Provide a helpful, professional response based on this context."""
+
+        session = await get_http_session()
+
+        payload = {
+            "model": config.LANGUAGE_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ],
+            "stream": True,
+            "keep_alive": "5m",
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "num_predict": 512
+            }
+        }
+
+        async with session.post(
+                "http://127.0.0.1:11434/api/chat",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60)
+        ) as response:
+
+            if response.status != 200:
+                yield f"Error: Failed to get response from AI model\n"
+                return
+
+            async for line in response.content:
+                line = line.decode('utf-8').strip()
+
+                if not line:
+                    continue
+
+                try:
+                    chunk_data = json.loads(line)
+
+                    if "message" in chunk_data and "content" in chunk_data["message"]:
+                        content = chunk_data["message"]["content"]
+                        yield content
+
+                    if chunk_data.get("done", False):
+                        break
+
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing stream chunk: {e}")
+                    continue
+
+    except Exception as e:
+        logger.error(f"Error in simple stream: {e}")
+        yield f"Error: {str(e)}\n"
+
+
+@app.post("/chat/stream-simple", tags=["Chat"])
+async def chat_stream_simple_endpoint(request: query_model.QueryRequest):
+    """
+    Simple streaming endpoint that just returns text content
+    """
+    try:
+        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
+
+        if not retrieved_chunks:
+            async def error_stream():
+                yield "Error: No relevant information found in the knowledge base.\n"
+
+            return StreamingResponse(error_stream(), media_type="text/plain")
+
+        return StreamingResponse(
+            stream_chat_response_simple(request.query, retrieved_chunks),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in simple streaming endpoint: {e}")
+
+        async def error_stream():
+            yield f"Error: Internal server error\n"
+
+        return StreamingResponse(error_stream(), media_type="text/plain")
 
 
 if __name__ == "__main__":
@@ -513,3 +629,10 @@ if __name__ == "__main__":
         reload=False,
         log_level="info"
     )
+# Cleanup on shutdown
+async def cleanup():
+    global http_session
+    if http_session:
+        await http_session.close()
+
+app.add_event_handler("shutdown", cleanup)

@@ -1,5 +1,7 @@
 import logging
+import time
 from contextlib import asynccontextmanager
+from functools import wraps
 from typing import List
 
 from fastapi import FastAPI, HTTPException
@@ -8,7 +10,7 @@ import datetime
 
 from pymongo.server_api import ServerApi
 
-from src import config
+from src import config, main
 import ollama
 
 from src import utils
@@ -23,6 +25,16 @@ logger = logging.getLogger(__name__)
 # db = client[config.DATABASE_NAME]
 # meta_collection = db[config.META_COLLECTION]
 # embeddings_collection = db[config.EMBEDDINGS_COLLECTION]
+
+def timing_decorator(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.time()
+        result = await func(*args, **kwargs)
+        end = time.time()
+        print(f"{func.__name__} took {end - start:.2f}s")
+        return result
+    return wrapper
 
 global client, db, meta_collection, embeddings_collection
 
@@ -51,7 +63,7 @@ def add_chunk_to_database(chunk_id, text, intent=None, category=None, chunk_type
     """Add a text chunk and its embedding to MongoDB."""
     try:
         # Create embedding
-        embedding = ollama.embed(model=config.EMBEDDING_MODEL, input=text)['embeddings'][0]
+        embedding = main.ollama_client.embed(model=config.EMBEDDING_MODEL, input=text)['embeddings'][0]
 
         # Store metadata
         meta_doc = {
@@ -79,55 +91,196 @@ def add_chunk_to_database(chunk_id, text, intent=None, category=None, chunk_type
         return False
 
 
+@timing_decorator
 async def retrieve_from_mongodb(query: str, top_n: int = 3) -> List[response_model.RetrievedChunk]:
-    """Retrieve most similar chunks from MongoDB"""
+    """Ultra-fast version with minimal candidates and direct lookup"""
     try:
-        logger.info(f"Starting retrieval for query: '{query[:50]}...'")
+        # await benchmark_retrieval(query, top_n)
 
-        # Create query embedding - this might be slow
-        logger.info("Creating query embedding...")
-        query_embedding = ollama.embed(model=config.EMBEDDING_MODEL, input=query)['embeddings'][0]
-        logger.info(f"Query embedding created successfully (dim: {len(query_embedding)})")
+        logger.info(f"Starting fast retrieval for query: '{query[:50]}...'")
 
-        # Get embeddings from MongoDB with limit to avoid memory issues
-        logger.info("Fetching embeddings from MongoDB...")
-        embedding_docs = list(embeddings_collection.find({}).limit(1000))  # Limit for testing
-        logger.info(f"Retrieved {len(embedding_docs)} embedding documents")
+        # Create query embedding (this is the main bottleneck)
+        query_embedding = main.ollama_client.embed(model=config.EMBEDDING_MODEL, input=query)['embeddings'][0]
 
-        if not embedding_docs:
-            logger.warning("No embeddings found in database!")
+        # Minimal vector search - just get the IDs
+        vector_pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index",
+                    "path": "embedding",
+                    "queryVector": query_embedding,
+                    "numCandidates": max(10, top_n * 2),  # Minimal candidates
+                    "limit": top_n
+                }
+            },
+            {
+                "$project": {
+                    "chunk_id": 1,
+                    "similarity": {"$meta": "vectorSearchScore"},
+                    "_id": 0
+                }
+            }
+        ]
+
+        # Execute vector search
+        vector_results = list(embeddings_collection.aggregate(vector_pipeline))
+        logger.info(f"Vector search found {len(vector_results)} results")
+
+        if not vector_results:
             return []
 
-        similarities = []
-        logger.info("Calculating similarities...")
+        # Direct lookup in metadata collection
+        chunk_ids = [doc['chunk_id'] for doc in vector_results]
+        metadata_cursor = meta_collection.find(
+            {"chunk_id": {"$in": chunk_ids}},
+            {"chunk_id": 1, "text": 1, "intent": 1, "category": 1, "_id": 0}
+        )
 
-        for i, emb_doc in enumerate(embedding_docs):
-            if i % 100 == 0:
-                logger.info(f"Processed {i}/{len(embedding_docs)} embeddings")
+        # Create lookup dictionary
+        metadata_dict = {doc['chunk_id']: doc for doc in metadata_cursor}
 
-            chunk_id = emb_doc['chunk_id']
-            embedding = emb_doc['embedding']
+        # Combine results
+        retrieved_chunks = []
+        for vector_doc in vector_results:
+            chunk_id = vector_doc['chunk_id']
+            metadata = metadata_dict.get(chunk_id)
 
-            # Get corresponding metadata
-            meta_doc = meta_collection.find_one({"chunk_id": chunk_id})
-            if meta_doc:
-                similarity = utils.cosine_similarity(query_embedding, embedding)
-                similarities.append(response_model.RetrievedChunk(
-                    chunk_id=chunk_id,
-                    text=meta_doc['text'],
-                    similarity=similarity,
-                    intent=meta_doc.get('intent'),
-                    category=meta_doc.get('category')
-                ))
+            if metadata:
+                retrieved_chunks.append(
+                    response_model.RetrievedChunk(
+                        chunk_id=chunk_id,
+                        text=metadata.get('text', ''),
+                        similarity=vector_doc['similarity'],
+                        intent=metadata.get('intent'),
+                        category=metadata.get('category')
+                    )
+                )
 
-        # Sort by similarity and return top N
-        similarities.sort(key=lambda x: x.similarity, reverse=True)
-        logger.info(f"Similarity calculation complete. Returning top {top_n} results")
-        return similarities[:top_n]
+        logger.info(f"Fast retrieval completed. Returning {len(retrieved_chunks)} chunks")
+        return retrieved_chunks
 
     except Exception as e:
-        logger.error(f"Error during retrieval: {e}")
-        raise HTTPException(status_code=500, detail=f"Retrieval error: {str(e)}")
+        logger.error(f"Error during fast retrieval: {e}")
+        raise HTTPException(status_code=500, detail=f"Fast retrieval error: {str(e)}")
+# async def retrieve_from_mongodb(query: str, top_n: int = 3) -> List[response_model.RetrievedChunk]:
+#     """Your existing function signature - just replace the body"""
+#     try:
+#         logger.info(f"Starting vector search for query: '{query[:50]}...'")
+#
+#         # Create query embedding
+#         query_embedding = ollama.embed(model=config.EMBEDDING_MODEL, input=query)['embeddings'][0]
+#
+#         # Vector search pipeline
+#         pipeline = [
+#             {
+#                 "$vectorSearch": {
+#                     "index": "vector_index",
+#                     "path": "embedding",
+#                     "queryVector": query_embedding,
+#                     "numCandidates": top_n * 5,
+#                     "limit": top_n * 5
+#                 }
+#             },
+#             {
+#                 "$addFields": {
+#                     "similarity": {"$meta": "vectorSearchScore"}
+#                 }
+#             },
+#             {
+#                 "$lookup": {
+#                     "from": "customer-support-meta",  # Your metadata collection name
+#                     "localField": "chunk_id",
+#                     "foreignField": "chunk_id",
+#                     "as": "metadata"
+#                 }
+#             },
+#             {
+#                 "$match": {"metadata": {"$ne": []}}
+#             },
+#             {
+#                 "$project": {
+#                     "chunk_id": 1,
+#                     "similarity": 1,
+#                     "text": {"$arrayElemAt": ["$metadata.text", 0]},
+#                     "intent": {"$arrayElemAt": ["$metadata.intent", 0]},
+#                     "category": {"$arrayElemAt": ["$metadata.category", 0]},
+#                     "_id": 0
+#                 }
+#             },
+#             {"$sort": {"similarity": -1}},
+#             {"$limit": top_n}
+#         ]
+#
+#         results = list(embeddings_collection.aggregate(pipeline))
+#
+#         return [
+#             response_model.RetrievedChunk(
+#                 chunk_id=doc['chunk_id'],
+#                 text=doc['text'],
+#                 similarity=doc['similarity'],
+#                 intent=doc.get('intent'),
+#                 category=doc.get('category')
+#             )
+#             for doc in results
+#         ]
+#
+#     except Exception as e:
+#         logger.error(f"Error during vector search: {e}")
+#         raise HTTPException(status_code=500, detail=f"Vector search error: {str(e)}")
+#
+
+
+async def benchmark_retrieval(query: str, top_n: int = 3):
+    """Benchmark different parts of retrieval"""
+
+    # Benchmark embedding creation
+    start = time.time()
+    query_embedding = ollama.embed(model=config.EMBEDDING_MODEL, input=query)['embeddings'][0]
+    embedding_time = time.time() - start
+    print(f"Embedding creation: {embedding_time:.2f}s")
+
+    # Benchmark vector search only
+    start = time.time()
+    vector_pipeline = [
+        {
+            "$vectorSearch": {
+                "index": "vector_index",
+                "path": "embedding",
+                "queryVector": query_embedding,
+                "numCandidates": 10,
+                "limit": top_n
+            }
+        },
+        {"$project": {"chunk_id": 1, "similarity": {"$meta": "vectorSearchScore"}}}
+    ]
+    vector_results = list(embeddings_collection.aggregate(vector_pipeline))
+    vector_time = time.time() - start
+    print(f"Vector search: {vector_time:.2f}s")
+
+    # Benchmark metadata lookup
+    start = time.time()
+    chunk_ids = [doc['chunk_id'] for doc in vector_results]
+    metadata_docs = list(meta_collection.find({"chunk_id": {"$in": chunk_ids}}))
+    lookup_time = time.time() - start
+    print(f"Metadata lookup: {lookup_time:.2f}s")
+
+    print(f"Total estimated: {embedding_time + vector_time + lookup_time:.2f}s")
+
+async def warm_up_model():
+    try:
+        retrieved_chunks = await retrieve_from_mongodb('hello', 3)
+
+        if not retrieved_chunks:
+            raise HTTPException(
+                status_code=404,
+                detail="No relevant information found in the knowledge base"
+            )
+
+        # Generate response
+        response_text = await main.generate_chat_response('hello', retrieved_chunks)
+        logger.info("Model pre-warmed successfully")
+    except Exception as e:
+        logger.error(f"Model warm-up failed: {e}")
 
 # MongoDB connection management
 @asynccontextmanager
@@ -135,6 +288,7 @@ async def lifespan(app: FastAPI):
     """Manage application startup and shutdown"""
     # Startup
     await connect_to_mongodb()
+    await warm_up_model()
     yield
     # Shutdown
     await close_mongodb_connection()
