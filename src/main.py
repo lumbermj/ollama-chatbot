@@ -48,7 +48,6 @@ async def get_http_session():
         http_session = aiohttp.ClientSession()
     return http_session
 
-
 def timing_decorator(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -59,85 +58,6 @@ def timing_decorator(func):
         return result
 
     return wrapper
-
-
-@app.get("/")
-def read_root():
-    return {"message": "Hello World"}
-
-
-@app.post("/chat", response_model=response_model.ChatResponse, tags=["Chat"])
-async def chat_endpoint(request: query_model.QueryRequest):
-    """
-    Main chat endpoint that retrieves relevant context and generates a response
-    """
-    start_time = datetime.datetime.now(datetime.timezone.utc)
-
-    try:
-        # Run retrieval and response generation concurrently where possible
-        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
-
-        if not retrieved_chunks:
-            raise HTTPException(
-                status_code=404,
-                detail="No relevant information found in the knowledge base"
-            )
-
-        # Generate response with optimized async call
-        response_text = await generate_chat_response_async(request.query, retrieved_chunks)
-
-        # Calculate processing time
-        processing_time = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
-
-        # Filter metadata if requested
-        if not request.include_metadata:
-            for chunk in retrieved_chunks:
-                chunk.intent = None
-                chunk.category = None
-
-        return response_model.ChatResponse(
-            query=request.query,
-            response=response_text,
-            retrieved_chunks=retrieved_chunks,
-            processing_time=processing_time,
-            timestamp=datetime.datetime.now(datetime.timezone.utc)
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in chat endpoint: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.post("/retrieve", response_model=List[response_model.RetrievedChunk], tags=["Retrieval"])
-async def retrieve_endpoint(request: query_model.QueryRequest):
-    """
-    Retrieve similar chunks without generating a chat response
-    """
-    try:
-        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
-
-        if not retrieved_chunks:
-            raise HTTPException(
-                status_code=404,
-                detail="No relevant information found in the knowledge base"
-            )
-
-        # Filter metadata if requested
-        if not request.include_metadata:
-            for chunk in retrieved_chunks:
-                chunk.intent = None
-                chunk.category = None
-
-        return retrieved_chunks
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in retrieve endpoint: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
 
 @timing_decorator
 async def generate_chat_response_async(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
@@ -199,8 +119,7 @@ Provide a helpful, professional response based on this context."""
         logger.error(f"Error generating chat response: {e}")
         raise HTTPException(status_code=500, detail=f"Chat generation error: {str(e)}")
 
-
-# Fallback sync version for compatibility
+# Fallback sync version for compatibility - Debugging
 @timing_decorator
 async def generate_chat_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
     """Original sync version - kept for backward compatibility"""
@@ -211,7 +130,6 @@ async def generate_chat_response(query: str, retrieved_chunks: List[response_mod
     except Exception as e:
         logger.error(f"Error generating chat response: {e}")
         raise HTTPException(status_code=500, detail="Chat generation failed")
-
 
 def _generate_sync_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> str:
     """Synchronous response generation"""
@@ -245,150 +163,7 @@ Provide a helpful, professional response based on this context.'''
 
     return response['message']['content']
 
-
-@app.get("/health", response_model=health_model.HealthStatus, tags=["Health"])
-async def health_check():
-    """Health check endpoint"""
-    try:
-        # Check MongoDB
-        mongodb_connected = False
-        total_chunks = 0
-        try:
-            mongodb.client.admin.command('ping')
-            mongodb_connected = True
-            total_chunks = mongodb.meta_collection.count_documents({})
-        except:
-            pass
-
-        # Check Ollama
-        ollama_available = False
-        try:
-            ollama.list()
-            ollama_available = True
-        except:
-            pass
-
-        status = "healthy" if mongodb_connected and ollama_available else "degraded"
-
-        return health_model.HealthStatus(
-            status=status,
-            mongodb_connected=mongodb_connected,
-            ollama_available=ollama_available,
-            total_chunks=total_chunks,
-            embedding_model=config.EMBEDDING_MODEL,
-            language_model=config.LANGUAGE_MODEL
-        )
-
-    except Exception as e:
-        logger.error(f"Error in health check: {e}")
-        raise HTTPException(status_code=500, detail="Health check failed")
-
-
-@app.get("/stats", response_model=database_model.DatabaseStats, tags=["Statistics"])
-async def get_database_stats():
-    """Get database statistics"""
-    try:
-        meta_count = mongodb.meta_collection.count_documents({})
-        embeddings_count = mongodb.embeddings_collection.count_documents({})
-
-        # Get intent distribution
-        intent_pipeline = [
-            {"$group": {"_id": "$intent", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 10}
-        ]
-        top_intents = list(mongodb.meta_collection.aggregate(intent_pipeline))
-
-        # Get category distribution
-        category_pipeline = [
-            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}}
-        ]
-        categories = list(mongodb.meta_collection.aggregate(category_pipeline))
-
-        return database_model.DatabaseStats(
-            total_chunks=meta_count,
-            total_embeddings=embeddings_count,
-            top_intents=top_intents,
-            categories=categories,
-            last_updated=datetime.datetime.now(datetime.timezone.utc)
-        )
-
-    except Exception as e:
-        logger.error(f"Error getting database stats: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get database statistics")
-
-
-@app.get("/search", tags=["Search"])
-async def search_by_intent_or_category(
-        intent: Optional[str] = Query(None, description="Filter by intent"),
-        category: Optional[str] = Query(None, description="Filter by category"),
-        limit: int = Query(10, ge=1, le=100, description="Number of results to return")
-):
-    """Search chunks by intent or category"""
-    try:
-        query_filter = {}
-        if intent:
-            query_filter["intent"] = intent
-        if category:
-            query_filter["category"] = category
-
-        results = list(mongodb.meta_collection.find(query_filter).limit(limit))
-
-        # Convert ObjectId to string for JSON serialization
-        for result in results:
-            result["_id"] = str(result["_id"])
-
-        return {
-            "filter": query_filter,
-            "count": len(results),
-            "results": results
-        }
-
-    except Exception as e:
-        logger.error(f"Error in search endpoint: {e}")
-        raise HTTPException(status_code=500, detail="Search failed")
-
-
-@app.post("/chat/stream", tags=["Chat"])
-async def chat_stream_endpoint(request: query_model.QueryRequest):
-    """
-    Streaming chat endpoint for real-time response generation
-    """
-    try:
-        # First, retrieve relevant chunks
-        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
-
-        if not retrieved_chunks:
-            # Return error as SSE event
-            async def error_stream():
-                yield f"data: {json.dumps({'error': 'No relevant information found'})}\n\n"
-
-            return StreamingResponse(error_stream(), media_type="text/plain")
-
-        # Stream the response
-        return StreamingResponse(
-            stream_chat_response(request.query, retrieved_chunks),
-            media_type="text/plain",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "*",
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error in streaming chat endpoint: {e}")
-
-        async def error_stream():
-            yield f"data: {json.dumps({'error': 'Internal server error'})}\n\n"
-
-        return StreamingResponse(error_stream(), media_type="text/plain")
-
-
-async def stream_chat_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> AsyncGenerator[
-    str, None]:
+async def stream_chat_response(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> AsyncGenerator[str, None]:
     """
     Generate streaming chat response using async HTTP calls to Ollama
     """
@@ -509,109 +284,215 @@ Provide a helpful, professional response based on this context."""
         }
         yield f"data: {json.dumps(error_data)}\n\n"
 
+@app.get("/")
+def read_root():
+    return {"message": "Chatbot Backend using Ollama + FastAPI"}
 
-# Alternative: Simple text streaming version
-async def stream_chat_response_simple(query: str, retrieved_chunks: List[response_model.RetrievedChunk]) -> \
-AsyncGenerator[str, None]:
+@app.post("/chat", response_model=response_model.ChatResponse, tags=["Chat"])
+async def chat_endpoint(request: query_model.QueryRequest):
     """
-    Simplified streaming version that just streams text content
+    Main chat endpoint that retrieves relevant context and generates a response
     """
+    start_time = datetime.datetime.now(datetime.timezone.utc)
+
     try:
-        context_chunks = [chunk.text for chunk in retrieved_chunks]
-        max_context_length = 2000
+        # Run retrieval and response generation concurrently where possible
+        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
 
-        context_text = '\n - '.join(context_chunks)
-        if len(context_text) > max_context_length:
-            context_text = context_text[:max_context_length] + "..."
+        if not retrieved_chunks:
+            raise HTTPException(
+                status_code=404,
+                detail="No relevant information found in the knowledge base"
+            )
 
-        system_prompt = f"""You are a helpful customer support chatbot. Use only the following context to answer the customer's question:
+        # Generate response with optimized async call
+        response_text = await generate_chat_response_async(request.query, retrieved_chunks)
 
-{context_text}
+        # Calculate processing time
+        processing_time = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
 
-Provide a helpful, professional response based on this context."""
+        # Filter metadata if requested
+        if not request.include_metadata:
+            for chunk in retrieved_chunks:
+                chunk.intent = None
+                chunk.category = None
 
-        session = await get_http_session()
+        return response_model.ChatResponse(
+            query=request.query,
+            response=response_text,
+            retrieved_chunks=retrieved_chunks,
+            processing_time=processing_time,
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
 
-        payload = {
-            "model": config.LANGUAGE_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query}
-            ],
-            "stream": True,
-            "keep_alive": "5m",
-            "options": {
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "num_predict": 512
-            }
-        }
-
-        async with session.post(
-                "http://127.0.0.1:11434/api/chat",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60)
-        ) as response:
-
-            if response.status != 200:
-                yield f"Error: Failed to get response from AI model\n"
-                return
-
-            async for line in response.content:
-                line = line.decode('utf-8').strip()
-
-                if not line:
-                    continue
-
-                try:
-                    chunk_data = json.loads(line)
-
-                    if "message" in chunk_data and "content" in chunk_data["message"]:
-                        content = chunk_data["message"]["content"]
-                        yield content
-
-                    if chunk_data.get("done", False):
-                        break
-
-                except json.JSONDecodeError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error processing stream chunk: {e}")
-                    continue
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in simple stream: {e}")
-        yield f"Error: {str(e)}\n"
+        logger.error(f"Unexpected error in chat endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-
-@app.post("/chat/stream-simple", tags=["Chat"])
-async def chat_stream_simple_endpoint(request: query_model.QueryRequest):
+@app.post("/retrieve", response_model=List[response_model.RetrievedChunk], tags=["Retrieval"])
+async def retrieve_endpoint(request: query_model.QueryRequest):
     """
-    Simple streaming endpoint that just returns text content
+    Retrieve similar chunks without generating a chat response
     """
     try:
         retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
 
         if not retrieved_chunks:
+            raise HTTPException(
+                status_code=404,
+                detail="No relevant information found in the knowledge base"
+            )
+
+        # Filter metadata if requested
+        if not request.include_metadata:
+            for chunk in retrieved_chunks:
+                chunk.intent = None
+                chunk.category = None
+
+        return retrieved_chunks
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in retrieve endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/health", response_model=health_model.HealthStatus, tags=["Health"])
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Check MongoDB
+        mongodb_connected = False
+        total_chunks = 0
+        try:
+            mongodb.client.admin.command('ping')
+            mongodb_connected = True
+            total_chunks = mongodb.meta_collection.count_documents({})
+        except:
+            pass
+
+        # Check Ollama
+        ollama_available = False
+        try:
+            ollama.list()
+            ollama_available = True
+        except:
+            pass
+
+        status = "healthy" if mongodb_connected and ollama_available else "degraded"
+
+        return health_model.HealthStatus(
+            status=status,
+            mongodb_connected=mongodb_connected,
+            ollama_available=ollama_available,
+            total_chunks=total_chunks,
+            embedding_model=config.EMBEDDING_MODEL,
+            language_model=config.LANGUAGE_MODEL
+        )
+
+    except Exception as e:
+        logger.error(f"Error in health check: {e}")
+        raise HTTPException(status_code=500, detail="Health check failed")
+
+@app.get("/stats", response_model=database_model.DatabaseStats, tags=["Statistics"])
+async def get_database_stats():
+    """Get database statistics"""
+    try:
+        meta_count = mongodb.meta_collection.count_documents({})
+        embeddings_count = mongodb.embeddings_collection.count_documents({})
+
+        # Get intent distribution
+        intent_pipeline = [
+            {"$group": {"_id": "$intent", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10}
+        ]
+        top_intents = list(mongodb.meta_collection.aggregate(intent_pipeline))
+
+        # Get category distribution
+        category_pipeline = [
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        categories = list(mongodb.meta_collection.aggregate(category_pipeline))
+
+        return database_model.DatabaseStats(
+            total_chunks=meta_count,
+            total_embeddings=embeddings_count,
+            top_intents=top_intents,
+            categories=categories,
+            last_updated=datetime.datetime.now(datetime.timezone.utc)
+        )
+
+    except Exception as e:
+        logger.error(f"Error getting database stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get database statistics")
+
+@app.get("/search", tags=["Search"])
+async def search_by_intent_or_category(
+        intent: Optional[str] = Query(None, description="Filter by intent"),
+        category: Optional[str] = Query(None, description="Filter by category"),
+        limit: int = Query(10, ge=1, le=100, description="Number of results to return")
+):
+    """Search chunks by intent or category"""
+    try:
+        query_filter = {}
+        if intent:
+            query_filter["intent"] = intent
+        if category:
+            query_filter["category"] = category
+
+        results = list(mongodb.meta_collection.find(query_filter).limit(limit))
+
+        # Convert ObjectId to string for JSON serialization
+        for result in results:
+            result["_id"] = str(result["_id"])
+
+        return {
+            "filter": query_filter,
+            "count": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"Error in search endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+@app.post("/chat/stream", tags=["Chat"])
+async def chat_stream_endpoint(request: query_model.QueryRequest):
+    """
+    Streaming chat endpoint for real-time response generation
+    """
+    try:
+        # First, retrieve relevant chunks
+        retrieved_chunks = await mongodb.retrieve_from_mongodb(request.query, request.top_n)
+
+        if not retrieved_chunks:
+            # Return error as SSE event
             async def error_stream():
-                yield "Error: No relevant information found in the knowledge base.\n"
+                yield f"data: {json.dumps({'error': 'No relevant information found'})}\n\n"
 
             return StreamingResponse(error_stream(), media_type="text/plain")
 
+        # Stream the response
         return StreamingResponse(
-            stream_chat_response_simple(request.query, retrieved_chunks),
+            stream_chat_response(request.query, retrieved_chunks),
             media_type="text/plain",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
             }
         )
 
     except Exception as e:
-        logger.error(f"Error in simple streaming endpoint: {e}")
+        logger.error(f"Error in streaming chat endpoint: {e}")
 
         async def error_stream():
-            yield f"Error: Internal server error\n"
+            yield f"data: {json.dumps({'error': 'Internal server error'})}\n\n"
 
         return StreamingResponse(error_stream(), media_type="text/plain")
 
