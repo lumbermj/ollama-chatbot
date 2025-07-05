@@ -225,7 +225,7 @@ Provide a helpful, professional response based on this context."""
                 return
 
             # Process streaming response
-            full_response = ""
+            # full_response = ""
             async for line in response.content:
                 line = line.decode('utf-8').strip()
 
@@ -238,13 +238,13 @@ Provide a helpful, professional response based on this context."""
 
                     if "message" in chunk_data and "content" in chunk_data["message"]:
                         content = chunk_data["message"]["content"]
-                        full_response += content
+                        # full_response += content
 
                         # Send content chunk
                         chunk_response = {
                             "type": "content",
                             "content": content,
-                            "full_response": full_response
+                            # "full_response": full_response
                         }
                         yield f"data: {json.dumps(chunk_response)}\n\n"
 
@@ -253,7 +253,7 @@ Provide a helpful, professional response based on this context."""
                         # Send completion message
                         completion_data = {
                             "type": "complete",
-                            "full_response": full_response,
+                            # "full_response": full_response,
                             "total_duration": chunk_data.get("total_duration", 0),
                             "load_duration": chunk_data.get("load_duration", 0),
                             "prompt_eval_count": chunk_data.get("prompt_eval_count", 0),

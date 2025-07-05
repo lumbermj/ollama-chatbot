@@ -80,8 +80,8 @@ async def retrieve_from_mongodb(query: str, top_n: int = 3) -> List[response_mod
                     "index": "vector_index",
                     "path": "embedding",
                     "queryVector": query_embedding,
-                    "numCandidates": max(10, top_n * 2),  # Minimal candidates
-                    "limit": top_n
+                    "numCandidates": top_n * 25,  # Minimal candidates
+                    "limit": top_n * 5
                 }
             },
             {
